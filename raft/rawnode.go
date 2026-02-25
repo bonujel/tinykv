@@ -70,12 +70,28 @@ type Ready struct {
 type RawNode struct {
 	Raft *Raft
 	// Your Data Here (2A).
+	prevSoftState *SoftState
+	prevHardState pb.HardState
 }
 
 // NewRawNode returns a new RawNode given configuration and a list of raft peers.
 func NewRawNode(config *Config) (*RawNode, error) {
 	// Your Code Here (2A).
-	return nil, nil
+	r := newRaft(config)
+	rn := &RawNode{
+		Raft: r,
+	}
+	// Initialize prev state to current state
+	rn.prevSoftState = &SoftState{
+		Lead:      r.Lead,
+		RaftState: r.State,
+	}
+	rn.prevHardState = pb.HardState{
+		Term:   r.Term,
+		Vote:   r.Vote,
+		Commit: r.RaftLog.committed,
+	}
+	return rn, nil
 }
 
 // Tick advances the internal logical clock by a single tick.
@@ -143,12 +159,69 @@ func (rn *RawNode) Step(m pb.Message) error {
 // Ready returns the current point-in-time state of this RawNode.
 func (rn *RawNode) Ready() Ready {
 	// Your Code Here (2A).
-	return Ready{}
+	r := rn.Raft
+	rd := Ready{
+		Messages: r.msgs,
+	}
+
+	// Check if SoftState changed
+	if r.Lead != rn.prevSoftState.Lead || r.State != rn.prevSoftState.RaftState {
+		rd.SoftState = &SoftState{
+			Lead:      r.Lead,
+			RaftState: r.State,
+		}
+	}
+
+	// Check if HardState changed
+	if r.Term != rn.prevHardState.Term || r.Vote != rn.prevHardState.Vote || r.RaftLog.committed != rn.prevHardState.Commit {
+		rd.HardState = pb.HardState{
+			Term:   r.Term,
+			Vote:   r.Vote,
+			Commit: r.RaftLog.committed,
+		}
+	}
+
+	// Get unstable entries (not yet persisted)
+	rd.Entries = r.RaftLog.unstableEntries()
+
+	// Get committed entries (ready to apply)
+	if r.RaftLog.committed > r.RaftLog.applied {
+		rd.CommittedEntries = r.RaftLog.nextEnts()
+	}
+
+	return rd
 }
 
 // HasReady called when RawNode user need to check if any Ready pending.
 func (rn *RawNode) HasReady() bool {
 	// Your Code Here (2A).
+	r := rn.Raft
+
+	// Check if SoftState changed
+	if r.Lead != rn.prevSoftState.Lead || r.State != rn.prevSoftState.RaftState {
+		return true
+	}
+
+	// Check if HardState changed
+	if r.Term != rn.prevHardState.Term || r.Vote != rn.prevHardState.Vote || r.RaftLog.committed != rn.prevHardState.Commit {
+		return true
+	}
+
+	// Check if there are unstable entries
+	if len(rn.Raft.RaftLog.unstableEntries()) > 0 {
+		return true
+	}
+
+	// Check if there are committed entries to apply
+	if rn.Raft.RaftLog.committed > rn.Raft.RaftLog.applied {
+		return true
+	}
+
+	// Check if there are messages to send
+	if len(r.msgs) > 0 {
+		return true
+	}
+
 	return false
 }
 
@@ -156,6 +229,32 @@ func (rn *RawNode) HasReady() bool {
 // last Ready results.
 func (rn *RawNode) Advance(rd Ready) {
 	// Your Code Here (2A).
+	r := rn.Raft
+
+	// Update prevSoftState if it changed
+	if rd.SoftState != nil {
+		rn.prevSoftState = rd.SoftState
+	}
+
+	// Update prevHardState if it changed
+	if !IsEmptyHardState(rd.HardState) {
+		rn.prevHardState = rd.HardState
+	}
+
+	// Update applied index if there were committed entries
+	if len(rd.CommittedEntries) > 0 {
+		lastIdx := rd.CommittedEntries[len(rd.CommittedEntries)-1].Index
+		r.RaftLog.applied = lastIdx
+	}
+
+	// Update stabled index if there were entries to persist
+	if len(rd.Entries) > 0 {
+		lastIdx := rd.Entries[len(rd.Entries)-1].Index
+		r.RaftLog.stabled = lastIdx
+	}
+
+	// Clear messages that were sent
+	r.msgs = nil
 }
 
 // GetProgress return the Progress of this node and its peers, if this
