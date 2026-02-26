@@ -232,7 +232,26 @@ func (r *Raft) sendAppend(to uint64) bool {
 	prevTerm, err := r.RaftLog.Term(prevIndex)
 	if err != nil {
 		// Entry not available, need snapshot (will implement in 2C)
-		return false
+		// Try to get snapshot from storage
+		snapshot, err := r.RaftLog.storage.Snapshot()
+		if err != nil {
+			// If snapshot temporarily unavailable, return false to retry later
+			if err == ErrSnapshotTemporarilyUnavailable {
+				return false
+			}
+			// Other errors, can't send anything
+			return false
+		}
+
+		// Send snapshot to follower
+		r.msgs = append(r.msgs, pb.Message{
+			MsgType:  pb.MessageType_MsgSnapshot,
+			To:       to,
+			From:     r.id,
+			Term:     r.Term,
+			Snapshot: &snapshot,
+		})
+		return true
 	}
 
 	// Get entries to send
@@ -410,6 +429,8 @@ func (r *Raft) Step(m pb.Message) error {
 		if r.State == StateLeader {
 			r.handleAppendResponse(m)
 		}
+	case pb.MessageType_MsgSnapshot:
+		r.handleSnapshot(m)
 	}
 
 	return nil
@@ -554,6 +575,19 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 	// Check if term matches at prevLogIndex
 	if m.Index > 0 {
 		term, err := r.RaftLog.Term(m.Index)
+		if err == ErrCompacted {
+			// Log has been compacted; tell leader our last index so it can fast-forward (likely via snapshot)
+			resp := pb.Message{
+				MsgType: pb.MessageType_MsgAppendResponse,
+				To:      m.From,
+				From:    r.id,
+				Term:    r.Term,
+				Index:   r.RaftLog.LastIndex(),
+				Reject:  true,
+			}
+			r.msgs = append(r.msgs, resp)
+			return
+		}
 		if err != nil || term != m.LogTerm {
 			// Conflict - find the index to retry
 			conflictIndex := m.Index
@@ -651,6 +685,61 @@ func (r *Raft) handleHeartbeatResponse(m pb.Message) {
 // handleSnapshot handle Snapshot RPC request
 func (r *Raft) handleSnapshot(m pb.Message) {
 	// Your Code Here (2C).
+	meta := m.Snapshot.Metadata
+
+	// Reject if snapshot is stale (index <= committed)
+	// We use committed instead of applied because we want to reject snapshots
+	// that are older than what we've already committed
+	if meta.Index <= r.RaftLog.committed {
+		// Send response indicating we're already past this snapshot
+		r.msgs = append(r.msgs, pb.Message{
+			MsgType: pb.MessageType_MsgAppendResponse,
+			To:      m.From,
+			From:    r.id,
+			Term:    r.Term,
+			Index:   r.RaftLog.committed,
+		})
+		return
+	}
+
+	// Update term and become follower if snapshot is from a newer term
+	if m.Term > r.Term {
+		r.becomeFollower(m.Term, m.From)
+	} else if r.State != StateFollower {
+		r.becomeFollower(r.Term, m.From)
+	} else {
+		// Already a follower, just update leader
+		r.Lead = m.From
+	}
+
+	// Store snapshot in pendingSnapshot for upper layer to apply
+	r.RaftLog.pendingSnapshot = m.Snapshot
+
+	// Clear all entries - snapshot supersedes them
+	r.RaftLog.entries = []pb.Entry{}
+
+	// Update log indices to reflect snapshot
+	r.RaftLog.committed = meta.Index
+	r.RaftLog.applied = meta.Index
+	r.RaftLog.stabled = meta.Index
+
+	// Restore peer configuration from snapshot
+	r.Prs = make(map[uint64]*Progress)
+	for _, node := range meta.ConfState.Nodes {
+		r.Prs[node] = &Progress{
+			Match: 0,
+			Next:  r.RaftLog.LastIndex() + 1,
+		}
+	}
+
+	// Send response to leader
+	r.msgs = append(r.msgs, pb.Message{
+		MsgType: pb.MessageType_MsgAppendResponse,
+		To:      m.From,
+		From:    r.id,
+		Term:    r.Term,
+		Index:   meta.Index,
+	})
 }
 
 // handleAppendResponse handles AppendEntries response from followers

@@ -189,6 +189,11 @@ func (rn *RawNode) Ready() Ready {
 		rd.CommittedEntries = r.RaftLog.nextEnts()
 	}
 
+	// Include pending snapshot if present (2C)
+	if r.RaftLog.pendingSnapshot != nil && !IsEmptySnap(r.RaftLog.pendingSnapshot) {
+		rd.Snapshot = *r.RaftLog.pendingSnapshot
+	}
+
 	return rd
 }
 
@@ -214,6 +219,11 @@ func (rn *RawNode) HasReady() bool {
 
 	// Check if there are committed entries to apply
 	if rn.Raft.RaftLog.committed > rn.Raft.RaftLog.applied {
+		return true
+	}
+
+	// Check if there is a pending snapshot to apply
+	if r.RaftLog.pendingSnapshot != nil && !IsEmptySnap(r.RaftLog.pendingSnapshot) {
 		return true
 	}
 
@@ -251,6 +261,13 @@ func (rn *RawNode) Advance(rd Ready) {
 	if len(rd.Entries) > 0 {
 		lastIdx := rd.Entries[len(rd.Entries)-1].Index
 		r.RaftLog.stabled = lastIdx
+	}
+
+	// Clear pending snapshot after it's been processed (2C)
+	if !IsEmptySnap(&rd.Snapshot) {
+		r.RaftLog.pendingSnapshot = nil
+		// Compact log entries that are now included in the snapshot
+		r.RaftLog.maybeCompact()
 	}
 
 	// Clear messages that were sent

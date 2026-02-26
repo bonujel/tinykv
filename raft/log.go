@@ -83,6 +83,25 @@ func newLog(storage Storage) *RaftLog {
 // grow unlimitedly in memory
 func (l *RaftLog) maybeCompact() {
 	// Your Code Here (2C).
+	// Get the first index from storage (reflects truncated state after compaction)
+	firstIndex, err := l.storage.FirstIndex()
+	if err != nil {
+		return
+	}
+
+	// Remove entries from l.entries that are before firstIndex
+	// These entries are already included in the snapshot
+	if len(l.entries) > 0 && l.entries[0].Index < firstIndex {
+		// Find the position where entries start from firstIndex
+		offset := firstIndex - l.entries[0].Index
+		if offset >= uint64(len(l.entries)) {
+			// All entries are compacted
+			l.entries = []pb.Entry{}
+		} else {
+			// Keep only entries from firstIndex onwards
+			l.entries = l.entries[offset:]
+		}
+	}
 }
 
 // allEntries return all the entries not compacted.
@@ -121,10 +140,16 @@ func (l *RaftLog) LastIndex() uint64 {
 	if len(l.entries) > 0 {
 		return l.entries[len(l.entries)-1].Index
 	}
+	// Check pending snapshot first (2C)
+	if l.pendingSnapshot != nil && l.pendingSnapshot.Metadata != nil {
+		return l.pendingSnapshot.Metadata.Index
+	}
 	// If no entries, get from snapshot
 	snapshot, err := l.storage.Snapshot()
 	if err != nil {
-		panic(err)
+		// If snapshot is temporarily unavailable, return stabled index
+		// This can happen during initialization
+		return l.stabled
 	}
 	return snapshot.Metadata.Index
 }
@@ -137,6 +162,11 @@ func (l *RaftLog) Term(i uint64) (uint64, error) {
 		if i >= firstIdx && i <= l.LastIndex() {
 			return l.entries[i-firstIdx].Term, nil
 		}
+	}
+
+	// Check pending snapshot (2C)
+	if l.pendingSnapshot != nil && l.pendingSnapshot.Metadata != nil && i == l.pendingSnapshot.Metadata.Index {
+		return l.pendingSnapshot.Metadata.Term, nil
 	}
 
 	// Check snapshot
