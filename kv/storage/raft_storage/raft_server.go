@@ -138,15 +138,15 @@ func (rs *RaftStorage) Reader(ctx *kvrpcpb.Context) (storage.StorageReader, erro
 
 	resp := cb.WaitResp()
 	if err := rs.checkResponse(resp, 1); err != nil {
-		if cb.Txn != nil {
-			cb.Txn.Discard()
+		if cb.GetTxn() != nil {
+			cb.GetTxn().Discard()
 		}
 		return nil, err
 	}
-	if cb.Txn == nil {
+	if cb.GetTxn() == nil {
 		panic("can not found region snap")
 	}
-	return NewRegionReader(cb.Txn, *resp.Responses[0].GetSnap().Region), nil
+	return NewRegionReader(cb.GetTxn(), *resp.Responses[0].GetSnap().Region), nil
 }
 
 func (rs *RaftStorage) Raft(stream tinykvpb.TinyKv_RaftServer) error {

@@ -153,6 +153,10 @@ func (ps *PeerStorage) FirstIndex() (uint64, error) {
 
 func (ps *PeerStorage) Snapshot() (eraftpb.Snapshot, error) {
 	var snapshot eraftpb.Snapshot
+	// If peer isn't initialized yet, don't try to generate snapshot.
+	if !ps.isInitialized() {
+		return snapshot, raft.ErrSnapshotTemporarilyUnavailable
+	}
 	if ps.snapState.StateType == snap.SnapState_Generating {
 		select {
 		case s := <-ps.snapState.Receiver:
@@ -339,6 +343,7 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 	if err := snapData.Unmarshal(snapshot.Data); err != nil {
 		return nil, err
 	}
+	wasInitialized := ps.isInitialized()
 
 	// Hint: things need to do here including: update peer storage state like raftState and applyState, etc,
 	// and send RegionTaskApply task to region worker through ps.regionSched, also remember call ps.clearMeta
@@ -355,13 +360,20 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 	ps.snapState.StateType = snap.SnapState_Applying
 
 	// Send RegionTaskApply to region worker
+	startKey, endKey := ps.region.StartKey, ps.region.EndKey
+	// For a newly created (uninitialized) peer, clearing the old empty range
+	// would wipe the whole store. Only clear the incoming snapshot range.
+	if !wasInitialized {
+		startKey = snapData.Region.StartKey
+		endKey = snapData.Region.EndKey
+	}
 	notifier := make(chan bool, 1)
 	ps.regionSched <- &runner.RegionTaskApply{
 		RegionId: ps.region.Id,
 		Notifier: notifier,
 		SnapMeta: snapshot.Metadata,
-		StartKey: ps.region.StartKey,
-		EndKey:   ps.region.EndKey,
+		StartKey: startKey,
+		EndKey:   endKey,
 	}
 
 	// Wait for region worker to finish applying snapshot
@@ -373,7 +385,9 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 	}
 
 	// Clear extra data not covered by new region
-	ps.clearExtraData(snapData.Region)
+	if wasInitialized {
+		ps.clearExtraData(snapData.Region)
+	}
 
 	// Save previous region for result
 	prevRegion := ps.region

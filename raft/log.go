@@ -144,14 +144,12 @@ func (l *RaftLog) LastIndex() uint64 {
 	if l.pendingSnapshot != nil && l.pendingSnapshot.Metadata != nil {
 		return l.pendingSnapshot.Metadata.Index
 	}
-	// If no entries, get from snapshot
-	snapshot, err := l.storage.Snapshot()
+	// If no entries, fall back to storage last index.
+	lastIndex, err := l.storage.LastIndex()
 	if err != nil {
-		// If snapshot is temporarily unavailable, return stabled index
-		// This can happen during initialization
 		return l.stabled
 	}
-	return snapshot.Metadata.Index
+	return lastIndex
 }
 
 // Term return the term of the entry in the given index
@@ -167,12 +165,6 @@ func (l *RaftLog) Term(i uint64) (uint64, error) {
 	// Check pending snapshot (2C)
 	if l.pendingSnapshot != nil && l.pendingSnapshot.Metadata != nil && i == l.pendingSnapshot.Metadata.Index {
 		return l.pendingSnapshot.Metadata.Term, nil
-	}
-
-	// Check snapshot
-	snapshot, err := l.storage.Snapshot()
-	if err == nil && i == snapshot.Metadata.Index {
-		return snapshot.Metadata.Term, nil
 	}
 
 	// Try storage

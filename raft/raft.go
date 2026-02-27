@@ -242,7 +242,6 @@ func (r *Raft) sendAppend(to uint64) bool {
 			// Other errors, can't send anything
 			return false
 		}
-
 		// Send snapshot to follower
 		r.msgs = append(r.msgs, pb.Message{
 			MsgType:  pb.MessageType_MsgSnapshot,
@@ -255,7 +254,26 @@ func (r *Raft) sendAppend(to uint64) bool {
 	}
 
 	// Get entries to send
-	entries := r.RaftLog.getEntries(pr.Next, r.RaftLog.LastIndex()+1)
+	lastIndex := r.RaftLog.LastIndex()
+	entries := r.RaftLog.getEntries(pr.Next, lastIndex+1)
+	// If entries are unavailable due to compaction, send snapshot instead.
+	if entries == nil && pr.Next <= lastIndex {
+		snapshot, err := r.RaftLog.storage.Snapshot()
+		if err != nil {
+			if err == ErrSnapshotTemporarilyUnavailable {
+				return false
+			}
+			return false
+		}
+		r.msgs = append(r.msgs, pb.Message{
+			MsgType:  pb.MessageType_MsgSnapshot,
+			To:       to,
+			From:     r.id,
+			Term:     r.Term,
+			Snapshot: &snapshot,
+		})
+		return true
+	}
 
 	// Convert to pointers
 	var entryPtrs []*pb.Entry
@@ -316,6 +334,7 @@ func (r *Raft) becomeFollower(term uint64, lead uint64) {
 	r.Lead = lead
 	r.electionElapsed = 0
 	r.heartbeatElapsed = 0
+	r.leadTransferee = None
 }
 
 // becomeCandidate transform this peer's state to candidate
@@ -329,6 +348,7 @@ func (r *Raft) becomeCandidate() {
 	r.randomizedElectionTimeout = r.electionTimeout + rand.Intn(r.electionTimeout)
 	r.votes = make(map[uint64]bool)
 	r.votes[r.id] = true
+	r.leadTransferee = None
 }
 
 // becomeLeader transform this peer's state to leader
@@ -338,6 +358,7 @@ func (r *Raft) becomeLeader() {
 	r.Lead = r.id
 	r.heartbeatElapsed = 0
 	r.electionElapsed = 0
+	r.leadTransferee = None
 
 	// Initialize Progress for all peers
 	lastIndex := r.RaftLog.LastIndex()
@@ -356,13 +377,17 @@ func (r *Raft) becomeLeader() {
 		Term:  r.Term,
 		Index: r.RaftLog.LastIndex() + 1,
 	})
-	r.Prs[r.id].Match = r.RaftLog.LastIndex()
-	r.Prs[r.id].Next = r.RaftLog.LastIndex() + 1
+
+	// Update self progress if we're still in the cluster
+	if pr, exists := r.Prs[r.id]; exists {
+		pr.Match = r.RaftLog.LastIndex()
+		pr.Next = r.RaftLog.LastIndex() + 1
+	}
 
 	// If single node, commit immediately
 	if len(r.Prs) == 1 {
 		r.RaftLog.committed = r.RaftLog.LastIndex()
-	} else {
+	} else if len(r.Prs) > 1 {
 		// Broadcast to replicate
 		r.bcastAppend()
 	}
@@ -394,11 +419,27 @@ func (r *Raft) Step(m pb.Message) error {
 	case pb.MessageType_MsgPropose:
 		// Only leader can handle proposals
 		if r.State == StateLeader {
+			// Block proposals during leader transfer
+			if r.leadTransferee != None {
+				return ErrProposalDropped
+			}
+
 			// Append entries to log
 			lastIndex := r.RaftLog.LastIndex()
 			for i, ent := range m.Entries {
 				ent.Term = r.Term
 				ent.Index = lastIndex + uint64(i) + 1
+
+				// Check for configuration change
+				if ent.EntryType == pb.EntryType_EntryConfChange {
+					// Only allow one pending conf change at a time
+					if r.PendingConfIndex != 0 {
+						// Drop this proposal
+						continue
+					}
+					r.PendingConfIndex = ent.Index
+				}
+
 				r.RaftLog.entries = append(r.RaftLog.entries, *ent)
 			}
 			// Update leader's progress
@@ -431,6 +472,14 @@ func (r *Raft) Step(m pb.Message) error {
 		}
 	case pb.MessageType_MsgSnapshot:
 		r.handleSnapshot(m)
+	case pb.MessageType_MsgTransferLeader:
+		r.handleTransferLeader(m)
+	case pb.MessageType_MsgTimeoutNow:
+		// Immediately start election (bypassing election timeout)
+		// Only if we're still in the cluster (have peers)
+		if r.State != StateLeader && len(r.Prs) > 0 {
+			r.Step(pb.Message{MsgType: pb.MessageType_MsgHup})
+		}
 	}
 
 	return nil
@@ -438,6 +487,11 @@ func (r *Raft) Step(m pb.Message) error {
 
 // campaign starts a new election
 func (r *Raft) campaign() {
+	// Don't campaign if we're not in the cluster
+	if _, exists := r.Prs[r.id]; !exists {
+		return
+	}
+
 	r.becomeCandidate()
 
 	// If single node, become leader immediately
@@ -758,6 +812,18 @@ func (r *Raft) handleAppendResponse(m pb.Message) {
 		pr.Match = m.Index
 		pr.Next = m.Index + 1
 
+		// Check if transferee has caught up
+		if r.leadTransferee == m.From && pr.Match == r.RaftLog.LastIndex() {
+			// Transferee is up-to-date, send MsgTimeoutNow
+			r.msgs = append(r.msgs, pb.Message{
+				MsgType: pb.MessageType_MsgTimeoutNow,
+				To:      m.From,
+				From:    r.id,
+				Term:    r.Term,
+			})
+			r.leadTransferee = None
+		}
+
 		// Try to advance commit index
 		r.maybeCommit()
 	}
@@ -794,6 +860,46 @@ func (r *Raft) maybeCommit() {
 	}
 }
 
+// handleTransferLeader handles leader transfer request
+func (r *Raft) handleTransferLeader(m pb.Message) {
+	// If we're not the leader, forward to leader
+	if r.State != StateLeader {
+		if r.Lead != None {
+			m.To = r.Lead
+			r.msgs = append(r.msgs, m)
+		}
+		return
+	}
+
+	// The transferee is specified in the From field
+	transferee := m.From
+	// Ignore if transferring to self
+	if transferee == r.id {
+		return
+	}
+
+	// Check if transferee exists in cluster
+	pr, exists := r.Prs[transferee]
+	if !exists {
+		return
+	}
+
+	// If transferee is already up-to-date, send MsgTimeoutNow immediately
+	if pr.Match == r.RaftLog.LastIndex() {
+		r.msgs = append(r.msgs, pb.Message{
+			MsgType: pb.MessageType_MsgTimeoutNow,
+			To:      transferee,
+			From:    r.id,
+			Term:    r.Term,
+		})
+		return
+	}
+
+	// Set leadTransferee to block new proposals and help transferee catch up
+	r.leadTransferee = transferee
+	r.sendAppend(transferee)
+}
+
 // bcastAppend sends append messages to all peers
 func (r *Raft) bcastAppend() {
 	for peer := range r.Prs {
@@ -806,10 +912,42 @@ func (r *Raft) bcastAppend() {
 
 // addNode add a new node to raft group
 func (r *Raft) addNode(id uint64) {
-	// Your Code Here (3A).
+	// Clear pending conf index regardless of whether node exists
+	r.PendingConfIndex = 0
+
+	// Check if node already exists
+	if _, exists := r.Prs[id]; exists {
+		return
+	}
+
+	// Add new peer with initial progress
+	r.Prs[id] = &Progress{
+		Match: 0,
+		Next:  r.RaftLog.LastIndex() + 1,
+	}
 }
 
 // removeNode remove a node from raft group
 func (r *Raft) removeNode(id uint64) {
-	// Your Code Here (3A).
+	// Clear pending conf index regardless of whether node exists
+	r.PendingConfIndex = 0
+
+	// Check if node exists
+	if _, exists := r.Prs[id]; !exists {
+		return
+	}
+
+	// Remove peer from progress map
+	delete(r.Prs, id)
+
+	// If removing self, become follower
+	if id == r.id {
+		r.becomeFollower(r.Term, None)
+		return
+	}
+
+	// If leader, try to advance commit (quorum size changed)
+	if r.State == StateLeader {
+		r.maybeCommit()
+	}
 }

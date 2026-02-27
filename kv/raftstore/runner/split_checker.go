@@ -33,7 +33,7 @@ func NewSplitCheckHandler(engine *badger.DB, router message.RaftRouter, conf *co
 	return runner
 }
 
-/// run checks a region with split checkers to produce split keys and generates split admin command.
+// / run checks a region with split checkers to produce split keys and generates split admin command.
 func (r *splitCheckHandler) Handle(t worker.Task) {
 	spCheckTask, ok := t.(*SplitCheckTask)
 	if !ok {
@@ -52,12 +52,17 @@ func (r *splitCheckHandler) Handle(t worker.Task) {
 			// To make sure the keys of same user key locate in one Region, decode and then encode to truncate the timestamp
 			key = codec.EncodeBytes(userKey)
 		}
+		epoch := region.GetRegionEpoch()
+		regionEpoch := &metapb.RegionEpoch{
+			ConfVer: epoch.GetConfVer(),
+			Version: epoch.GetVersion(),
+		}
 		msg := message.Msg{
 			Type:     message.MsgTypeSplitRegion,
 			RegionID: regionId,
 			Data: &message.MsgSplitRegion{
-				RegionEpoch: region.GetRegionEpoch(),
-				SplitKey:    key,
+				RegionEpoch: regionEpoch,
+				SplitKey:    util.SafeCopy(key),
 			},
 		}
 		err = r.router.Send(regionId, msg)
@@ -69,7 +74,7 @@ func (r *splitCheckHandler) Handle(t worker.Task) {
 	}
 }
 
-/// SplitCheck gets the split keys by scanning the range.
+// / SplitCheck gets the split keys by scanning the range.
 func (r *splitCheckHandler) splitCheck(regionID uint64, startKey, endKey []byte) []byte {
 	txn := r.engine.NewTransaction(false)
 	defer txn.Discard()

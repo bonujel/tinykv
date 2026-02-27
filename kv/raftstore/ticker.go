@@ -1,6 +1,7 @@
 package raftstore
 
 import (
+	"sync"
 	"time"
 
 	"github.com/pingcap-incubator/tinykv/kv/config"
@@ -8,6 +9,7 @@ import (
 )
 
 type ticker struct {
+	mu        sync.RWMutex
 	regionID  uint64
 	tick      int64
 	schedules []tickSchedule
@@ -45,11 +47,15 @@ func newStoreTicker(cfg *config.Config) *ticker {
 
 // tickClock should be called when peerMsgHandler received tick message.
 func (t *ticker) tickClock() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	t.tick++
 }
 
 // schedule arrange the next run for the PeerTick.
 func (t *ticker) schedule(tp PeerTick) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	sched := &t.schedules[int(tp)]
 	if sched.interval <= 0 {
 		sched.runAt = -1
@@ -60,16 +66,22 @@ func (t *ticker) schedule(tp PeerTick) {
 
 // isOnTick checks if the PeerTick should run.
 func (t *ticker) isOnTick(tp PeerTick) bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
 	sched := &t.schedules[int(tp)]
 	return sched.runAt == t.tick
 }
 
 func (t *ticker) isOnStoreTick(tp StoreTick) bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
 	sched := &t.schedules[int(tp)]
 	return sched.runAt == t.tick
 }
 
 func (t *ticker) scheduleStore(tp StoreTick) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	sched := &t.schedules[int(tp)]
 	if sched.interval <= 0 {
 		sched.runAt = -1

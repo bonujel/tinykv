@@ -94,9 +94,9 @@ func (d *storeWorker) start(store *metapb.Store) {
 	d.ticker.scheduleStore(StoreTickSnapGC)
 }
 
-/// Checks if the message is targeting a stale peer.
-///
-/// Returns true means the message can be dropped silently.
+// / Checks if the message is targeting a stale peer.
+// /
+// / Returns true means the message can be dropped silently.
 func (d *storeWorker) checkMsg(msg *rspb.RaftMessage) (bool, error) {
 	regionID := msg.GetRegionId()
 	fromEpoch := msg.GetRegionEpoch()
@@ -143,8 +143,11 @@ func (d *storeWorker) checkMsg(msg *rspb.RaftMessage) (bool, error) {
 		return true, nil
 	}
 	if fromEpoch.ConfVer == regionEpoch.ConfVer {
-		return false, errors.Errorf("tombstone peer [epoch: %s] received an invalid message %s, ignore it",
+		// Invalid messages to tombstone peer are expected during conf change races.
+		// Drop them quietly to avoid error storms starving normal traffic.
+		log.Debugf("tombstone peer [epoch: %s] received invalid message %s, ignore it",
 			regionEpoch, msgType)
+		return true, nil
 	}
 	return false, nil
 }
@@ -188,10 +191,10 @@ func (d *storeWorker) onRaftMessage(msg *rspb.RaftMessage) error {
 	return nil
 }
 
-/// If target peer doesn't exist, create it.
-///
-/// return false to indicate that target peer is in invalid state or
-/// doesn't exist and can't be created.
+// / If target peer doesn't exist, create it.
+// /
+// / return false to indicate that target peer is in invalid state or
+// / doesn't exist and can't be created.
 func (d *storeWorker) maybeCreatePeer(regionID uint64, msg *rspb.RaftMessage) (bool, error) {
 	// we may encounter a message with larger peer id, which means
 	// current peer is stale, then we should remove current peer
