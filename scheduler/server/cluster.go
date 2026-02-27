@@ -280,6 +280,44 @@ func (c *RaftCluster) handleStoreHeartbeat(stats *schedulerpb.StoreStats) error 
 func (c *RaftCluster) processRegionHeartbeat(region *core.RegionInfo) error {
 	// Your Code Here (3C).
 
+	// Check whether there is a region with the same Id in local storage.
+	origin := c.core.GetRegion(region.GetID())
+	if origin != nil {
+		// If the heartbeat's conf_ver or version is less than the existing one, it's stale.
+		regionEpoch := region.GetRegionEpoch()
+		originEpoch := origin.GetRegionEpoch()
+		if regionEpoch.GetVersion() < originEpoch.GetVersion() ||
+			regionEpoch.GetConfVer() < originEpoch.GetConfVer() {
+			return ErrRegionIsStale(region.GetMeta(), origin.GetMeta())
+		}
+	} else {
+		// No region with same ID. Scan all regions that overlap with it.
+		// The heartbeat's conf_ver and version should be >= all of them.
+		overlaps := c.core.GetOverlaps(region)
+		for _, overlap := range overlaps {
+			overlapEpoch := overlap.GetRegionEpoch()
+			regionEpoch := region.GetRegionEpoch()
+			if regionEpoch.GetVersion() < overlapEpoch.GetVersion() ||
+				regionEpoch.GetConfVer() < overlapEpoch.GetConfVer() {
+				return ErrRegionIsStale(region.GetMeta(), overlap.GetMeta())
+			}
+		}
+	}
+
+	// Update region tree.
+	c.core.PutRegion(region)
+
+	// Update related store status.
+	for _, peer := range region.GetPeers() {
+		c.updateStoreStatusLocked(peer.GetStoreId())
+	}
+	// Also update stores that were in the origin but not in the new region.
+	if origin != nil {
+		for _, peer := range origin.GetPeers() {
+			c.updateStoreStatusLocked(peer.GetStoreId())
+		}
+	}
+
 	return nil
 }
 
