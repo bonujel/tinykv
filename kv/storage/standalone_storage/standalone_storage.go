@@ -1,8 +1,11 @@
 package standalone_storage
 
 import (
+	"time"
+
 	"github.com/Connor1996/badger"
 	"github.com/pingcap-incubator/tinykv/kv/config"
+	"github.com/pingcap-incubator/tinykv/kv/metrics"
 	"github.com/pingcap-incubator/tinykv/kv/storage"
 	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/kvrpcpb"
@@ -38,15 +41,30 @@ func (s *StandAloneStorage) Reader(ctx *kvrpcpb.Context) (storage.StorageReader,
 }
 
 func (s *StandAloneStorage) Write(ctx *kvrpcpb.Context, batch []storage.Modify) error {
+	start := time.Now()
+	defer func() {
+		// Record write duration
+		metrics.StorageWriteDuration.Observe(time.Since(start).Seconds())
+	}()
+
 	wb := new(engine_util.WriteBatch)
+	totalBytes := 0
 	for _, m := range batch {
 		switch data := m.Data.(type) {
 		case storage.Put:
 			wb.SetCF(data.Cf, data.Key, data.Value)
+			totalBytes += len(data.Key) + len(data.Value)
+			metrics.StorageWriteOps.Inc()
 		case storage.Delete:
 			wb.DeleteCF(data.Cf, data.Key)
+			totalBytes += len(data.Key)
+			metrics.StorageWriteOps.Inc()
 		}
 	}
+
+	// Record bytes written
+	metrics.StorageWriteBytes.Add(float64(totalBytes))
+
 	return wb.WriteToDB(s.engine)
 }
 
@@ -56,10 +74,23 @@ type StandAloneStorageReader struct {
 }
 
 func (r *StandAloneStorageReader) GetCF(cf string, key []byte) ([]byte, error) {
+	start := time.Now()
+	defer func() {
+		// Record read duration
+		metrics.StorageReadDuration.Observe(time.Since(start).Seconds())
+		metrics.StorageReadOps.Inc()
+	}()
+
 	val, err := engine_util.GetCFFromTxn(r.txn, cf, key)
 	if err == badger.ErrKeyNotFound {
 		return nil, nil
 	}
+
+	// Record bytes read
+	if val != nil {
+		metrics.StorageReadBytes.Add(float64(len(key) + len(val)))
+	}
+
 	return val, err
 }
 

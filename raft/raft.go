@@ -16,8 +16,11 @@ package raft
 
 import (
 	"errors"
+	"fmt"
 	"math/rand"
+	"time"
 
+	"github.com/pingcap-incubator/tinykv/kv/metrics"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
 
@@ -160,6 +163,9 @@ type Raft struct {
 	// value.
 	// (Used in 3A conf change)
 	PendingConfIndex uint64
+
+	// Track last heartbeat time for metrics
+	lastHeartbeatTime time.Time
 }
 
 // newRaft return a raft peer with the given config
@@ -228,6 +234,13 @@ func newRaft(c *Config) *Raft {
 // current commit index to the given peer. Returns true if a message was sent.
 func (r *Raft) sendAppend(to uint64) bool {
 	pr := r.Prs[to]
+
+	// Track replication lag
+	if r.State == StateLeader {
+		lag := r.RaftLog.LastIndex() - pr.Match
+		metrics.RaftLogReplicationLag.WithLabelValues(fmt.Sprintf("%d", to)).Set(float64(lag))
+	}
+
 	prevIndex := pr.Next - 1
 	prevTerm, err := r.RaftLog.Term(prevIndex)
 	if err != nil {
@@ -320,6 +333,13 @@ func (r *Raft) tick() {
 	case StateLeader:
 		r.heartbeatElapsed++
 		if r.heartbeatElapsed >= r.heartbeatTimeout {
+			// Record heartbeat interval
+			if !r.lastHeartbeatTime.IsZero() {
+				interval := time.Since(r.lastHeartbeatTime).Seconds()
+				metrics.RaftHeartbeatInterval.Observe(interval)
+			}
+			r.lastHeartbeatTime = time.Now()
+
 			r.heartbeatElapsed = 0
 			r.Step(pb.Message{MsgType: pb.MessageType_MsgBeat})
 		}
@@ -327,6 +347,7 @@ func (r *Raft) tick() {
 }
 
 // becomeFollower transform this peer's state to Follower
+// becomeFollower transform this peer's state to follower
 func (r *Raft) becomeFollower(term uint64, lead uint64) {
 	r.State = StateFollower
 	r.Term = term
@@ -335,6 +356,9 @@ func (r *Raft) becomeFollower(term uint64, lead uint64) {
 	r.electionElapsed = 0
 	r.heartbeatElapsed = 0
 	r.leadTransferee = None
+
+	// Update metrics: this node is no longer leader
+	metrics.RaftLeaderGauge.WithLabelValues(fmt.Sprintf("%d", r.id)).Set(0)
 }
 
 // becomeCandidate transform this peer's state to candidate
@@ -359,6 +383,10 @@ func (r *Raft) becomeLeader() {
 	r.heartbeatElapsed = 0
 	r.electionElapsed = 0
 	r.leadTransferee = None
+
+	// Update metrics: leader election occurred
+	metrics.RaftLeaderChanges.Inc()
+	metrics.RaftLeaderGauge.WithLabelValues(fmt.Sprintf("%d", r.id)).Set(1)
 
 	// Initialize Progress for all peers
 	lastIndex := r.RaftLog.LastIndex()
@@ -396,6 +424,14 @@ func (r *Raft) becomeLeader() {
 // Step the entrance of handle message, see `MessageType`
 // on `eraftpb.proto` for what msgs should be handled
 func (r *Raft) Step(m pb.Message) error {
+	// Track proposal processing time
+	start := time.Now()
+	defer func() {
+		if m.MsgType == pb.MessageType_MsgPropose {
+			metrics.RaftProposalDuration.Observe(time.Since(start).Seconds())
+		}
+	}()
+
 	// Handle messages with higher term
 	if m.Term > r.Term {
 		leadHint := None
@@ -421,6 +457,7 @@ func (r *Raft) Step(m pb.Message) error {
 		if r.State == StateLeader {
 			// Block proposals during leader transfer
 			if r.leadTransferee != None {
+				metrics.RaftProposalTotal.WithLabelValues("dropped").Inc()
 				return ErrProposalDropped
 			}
 
@@ -452,6 +489,9 @@ func (r *Raft) Step(m pb.Message) error {
 			} else {
 				r.bcastAppend()
 			}
+			metrics.RaftProposalTotal.WithLabelValues("success").Inc()
+		} else {
+			metrics.RaftProposalTotal.WithLabelValues("not_leader").Inc()
 		}
 	case pb.MessageType_MsgRequestVote:
 		r.handleRequestVote(m)

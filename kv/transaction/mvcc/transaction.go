@@ -3,7 +3,9 @@ package mvcc
 import (
 	"bytes"
 	"encoding/binary"
+	"time"
 
+	"github.com/pingcap-incubator/tinykv/kv/metrics"
 	"github.com/pingcap-incubator/tinykv/kv/storage"
 	"github.com/pingcap-incubator/tinykv/kv/util/codec"
 	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
@@ -42,6 +44,15 @@ func (txn *MvccTxn) Writes() []storage.Modify {
 
 // PutWrite records a write at key and ts.
 func (txn *MvccTxn) PutWrite(key []byte, ts uint64, write *Write) {
+	start := time.Now()
+	defer func() {
+		// Record commit duration for write operations
+		if write.Kind == WriteKindPut || write.Kind == WriteKindDelete {
+			metrics.TxnCommitDuration.Observe(time.Since(start).Seconds())
+			metrics.TxnCommitTotal.WithLabelValues("success").Inc()
+		}
+	}()
+
 	txn.writes = append(txn.writes, storage.Modify{Data: storage.Put{
 		Cf:    engine_util.CfWrite,
 		Key:   EncodeKey(key, ts),
@@ -85,13 +96,15 @@ func (txn *MvccTxn) GetValue(key []byte) ([]byte, error) {
 	iter := txn.Reader.IterCF(engine_util.CfWrite)
 	defer iter.Close()
 
+	versionCount := 0
 	iter.Seek(EncodeKey(key, txn.StartTS))
 	for ; iter.Valid(); iter.Next() {
 		item := iter.Item()
 		userKey := DecodeUserKey(item.Key())
 		if !bytes.Equal(userKey, key) {
-			return nil, nil
+			break
 		}
+		versionCount++
 		value, err := item.Value()
 		if err != nil {
 			return nil, err
@@ -101,11 +114,15 @@ func (txn *MvccTxn) GetValue(key []byte) ([]byte, error) {
 			return nil, err
 		}
 		if write.Kind == WriteKindPut {
+			// Record MVCC version chain length
+			metrics.MvccVersions.Observe(float64(versionCount))
 			return txn.Reader.GetCF(engine_util.CfDefault, EncodeKey(key, write.StartTS))
 		}
 		// WriteKindDelete or WriteKindRollback
+		metrics.MvccVersions.Observe(float64(versionCount))
 		return nil, nil
 	}
+	metrics.MvccVersions.Observe(float64(versionCount))
 	return nil, nil
 }
 

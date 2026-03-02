@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/pingcap-incubator/tinykv/kv/config"
+	"github.com/pingcap-incubator/tinykv/kv/metrics"
 	"github.com/pingcap-incubator/tinykv/kv/server"
 	"github.com/pingcap-incubator/tinykv/kv/storage"
 	"github.com/pingcap-incubator/tinykv/kv/storage/raft_storage"
@@ -26,6 +27,7 @@ var (
 	storeAddr     = flag.String("addr", "", "store address")
 	dbPath        = flag.String("path", "", "directory path of db")
 	logLevel      = flag.String("loglevel", "", "the level of log")
+	metricsAddr   = flag.String("metrics-addr", ":9090", "Prometheus metrics address")
 )
 
 func main() {
@@ -48,6 +50,16 @@ func main() {
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds | log.Lshortfile)
 	log.Infof("Server started with conf %+v", conf)
 
+	// Start Prometheus metrics server
+	if *metricsAddr != "" {
+		go func() {
+			log.Infof("Starting metrics server on %s", *metricsAddr)
+			if err := metrics.StartMetricsServer(*metricsAddr); err != nil {
+				log.Errorf("Failed to start metrics server: %v", err)
+			}
+		}()
+	}
+
 	var storage storage.Storage
 	if conf.Raft {
 		storage = raft_storage.NewRaftStorage(conf)
@@ -58,6 +70,10 @@ func main() {
 		log.Fatal(err)
 	}
 	server := server.NewServer(storage)
+
+	// Start GC worker
+	log.Info("Starting MVCC GC worker")
+	server.GCWorker.Start()
 
 	var alivePolicy = keepalive.EnforcementPolicy{
 		MinTime:             2 * time.Second, // If a client pings more than once every 2 seconds, terminate the connection
@@ -76,7 +92,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	handleSignal(grpcServer)
+	handleSignal(grpcServer, server)
 
 	err = grpcServer.Serve(l)
 	if err != nil {
@@ -85,7 +101,7 @@ func main() {
 	log.Info("Server stopped.")
 }
 
-func handleSignal(grpcServer *grpc.Server) {
+func handleSignal(grpcServer *grpc.Server, kvServer *server.Server) {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh,
 		syscall.SIGHUP,
@@ -95,6 +111,11 @@ func handleSignal(grpcServer *grpc.Server) {
 	go func() {
 		sig := <-sigCh
 		log.Infof("Got signal [%s] to exit.", sig)
+
+		// Stop GC worker gracefully
+		log.Info("Stopping MVCC GC worker")
+		kvServer.GCWorker.Stop()
+
 		grpcServer.Stop()
 	}()
 }

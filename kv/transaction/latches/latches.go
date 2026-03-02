@@ -2,7 +2,9 @@ package latches
 
 import (
 	"sync"
+	"time"
 
+	"github.com/pingcap-incubator/tinykv/kv/metrics"
 	"github.com/pingcap-incubator/tinykv/kv/transaction/mvcc"
 )
 
@@ -82,6 +84,12 @@ func (l *Latches) ReleaseLatches(keysToUnlatch [][]byte) {
 // WaitForLatches will wait for it to become unlocked then try again. Therefore WaitForLatches may block for an unbounded
 // length of time.
 func (l *Latches) WaitForLatches(keysToLatch [][]byte) {
+	start := time.Now()
+	defer func() {
+		// Record lock wait duration
+		metrics.TxnLockWaitDuration.Observe(time.Since(start).Seconds())
+	}()
+
 	for {
 		wg := l.AcquireLatches(keysToLatch)
 		if wg == nil {

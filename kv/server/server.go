@@ -2,8 +2,10 @@ package server
 
 import (
 	"context"
+	"time"
 
 	"github.com/pingcap-incubator/tinykv/kv/coprocessor"
+	"github.com/pingcap-incubator/tinykv/kv/metrics"
 	"github.com/pingcap-incubator/tinykv/kv/storage"
 	"github.com/pingcap-incubator/tinykv/kv/storage/raft_storage"
 	"github.com/pingcap-incubator/tinykv/kv/transaction/latches"
@@ -23,14 +25,23 @@ type Server struct {
 	// (Used in 4B)
 	Latches *latches.Latches
 
+	// MVCC GC components
+	SafePointMgr *mvcc.SafePointManager
+	GCWorker     *mvcc.GCWorker
+
 	// coprocessor API handler, out of course scope
 	copHandler *coprocessor.CopHandler
 }
 
 func NewServer(storage storage.Storage) *Server {
+	safePointMgr := mvcc.NewSafePointManager()
+	gcWorker := mvcc.NewGCWorker(storage, safePointMgr, 10*time.Minute, 1000)
+
 	return &Server{
-		storage: storage,
-		Latches: latches.NewLatches(),
+		storage:      storage,
+		Latches:      latches.NewLatches(),
+		SafePointMgr: safePointMgr,
+		GCWorker:     gcWorker,
 	}
 }
 
@@ -86,6 +97,15 @@ func (server *Server) KvGet(_ context.Context, req *kvrpcpb.GetRequest) (*kvrpcp
 }
 
 func (server *Server) KvPrewrite(_ context.Context, req *kvrpcpb.PrewriteRequest) (*kvrpcpb.PrewriteResponse, error) {
+	start := time.Now()
+	defer func() {
+		metrics.TxnPrewriteDuration.Observe(time.Since(start).Seconds())
+	}()
+
+	// Register transaction with SafePointManager
+	server.SafePointMgr.RegisterTxn(req.StartVersion)
+	defer server.SafePointMgr.UnregisterTxn(req.StartVersion)
+
 	resp := &kvrpcpb.PrewriteResponse{}
 
 	reader, err := server.storage.Reader(req.Context)
